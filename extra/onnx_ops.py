@@ -245,7 +245,7 @@ def _approximate(x, ceil_mode=0): return math.ceil(x) if ceil_mode else math.flo
 
 def _padding(X: Tensor, pads=None, auto_pad="NOTSET", axes=None, constant_value=0., strides=None, kernel_shape=None, dilations=None, ceil_mode=0):
   if auto_pad != "NOTSET": pads = _auto_pad(X, auto_pad, strides, kernel_shape, dilations)
-  elif ceil_mode and auto_pad=="NOTSET": # is this reaching floor or just ceil?
+  elif ceil_mode and auto_pad=="NOTSET": # what if we want to use ceil(x)?
     if strides is not None: strides = [strides]*len(kernel_shape) if isinstance(strides, int) else strides if strides else [1]*len(kernel_shape)
     if dilations is not None: dilations = [1]*len(kernel_shape) if dilations == 1 else dilations
     out_spatial_shape = [_approximate((sh - dil * (ker-1)-1)/st + 1, ceil_mode=ceil_mode) for sh, st, ker, dil in zip(X.shape[-len(kernel_shape):], strides, kernel_shape, dilations)]
@@ -602,9 +602,8 @@ def DequantizeLinear(x: Tensor, x_scale: Tensor, x_zero_point: Union[Tensor, int
   x_zer = x_zero_point.reshape(*[1]*axis, *x_scale.shape, *[1]*(x.ndim - axis - x_scale.ndim)) if isinstance(x_zero_point, Tensor) else x_zero_point
   return ((x - x_zer) * x_sc).cast(x_scale.dtype)
 
-# realiable nan check 
 def IsNaN(x: Tensor):
-    return (x != x).cast(dtypes.bool)
+  return (x < float("-inf")).cast(dtypes.bool)
 
 # copied from https://github.com/onnx/onnx/blob/main/onnx/reference/ops/op_image_decoder.py
 # without importing PIL we'll have to manually decode a bunch of image formats like PNG, JPEG, WebP, etc
