@@ -241,12 +241,14 @@ def _format_padding(onnx_pads, ndims=None, axes=None):
     np_pads[axes[i]] = (onnx_pads[i], onnx_pads[i + num_axes])
   return np_pads
 
+def _approximate(x, ceil_mode=0): return math.ceil(x) if ceil_mode else math.floor(x)
+
 def _padding(X: Tensor, pads=None, auto_pad="NOTSET", axes=None, constant_value=0., strides=None, kernel_shape=None, dilations=None, ceil_mode=0):
   if auto_pad != "NOTSET": pads = _auto_pad(X, auto_pad, strides, kernel_shape, dilations)
-  elif ceil_mode and auto_pad=="NOTSET": # stupid ceil_mode case
+  elif ceil_mode and auto_pad=="NOTSET": # is this reaching floor or just ceil?
     if strides is not None: strides = [strides]*len(kernel_shape) if isinstance(strides, int) else strides if strides else [1]*len(kernel_shape)
     if dilations is not None: dilations = [1]*len(kernel_shape) if dilations == 1 else dilations
-    out_spatial_shape = [math.ceil((sh - dil * (ker-1)-1)/st + 1) if ceil_mode else math.floor((sh - dil * (ker-1)-1)/st + 1) for sh, st, ker, dil in zip(X.shape[-len(kernel_shape):], strides, kernel_shape, dilations)]
+    out_spatial_shape = [_approximate((sh - dil * (ker-1)-1)/st + 1, ceil_mode=ceil_mode) for sh, st, ker, dil in zip(X.shape[-len(kernel_shape):], strides, kernel_shape, dilations)]
     pad_shape = [(osh-1)*st+((ks-1)*dil+1)-ish for osh, st, ks, dil, ish in zip(out_spatial_shape, strides, kernel_shape, dilations, X.shape[-len(kernel_shape):])]
     pad_shape = flatten([[sh//2, sh-sh//2] for sh in pad_shape])
     pads = pad_shape[::2] + pad_shape[1::2]
@@ -587,10 +589,10 @@ def EyeLike(x: Tensor, dtype=None, k=0):
 
 def Upsample(X, scales, mode): return Resize(X=X, scales=scales, mode=mode)
 
-# Needs work
 def IsInf(x: Tensor, detect_negative=1, detect_positive=1):
-  ret = (x == float("inf"))*detect_positive + (x == float("-inf"))*detect_negative + Tensor.zeros(*x.shape)
-  return ret.cast(dtypes.bool)
+  positive_inf = (x == float("inf")) if detect_positive else False
+  negative_inf = (x == float("-inf")) if detect_negative else False
+  return (positive_inf | negative_inf).cast(dtypes.bool)
 
 def DequantizeLinear(x: Tensor, x_scale: Tensor, x_zero_point: Union[Tensor, int] = 0, axis=1):
   axis = axis + x.ndim if axis < 0 else axis
@@ -600,9 +602,9 @@ def DequantizeLinear(x: Tensor, x_scale: Tensor, x_zero_point: Union[Tensor, int
   x_zer = x_zero_point.reshape(*[1]*axis, *x_scale.shape, *[1]*(x.ndim - axis - x_scale.ndim)) if isinstance(x_zero_point, Tensor) else x_zero_point
   return ((x - x_zer) * x_sc).cast(x_scale.dtype)
 
-# Needs work
+# realiable nan check 
 def IsNaN(x: Tensor):
-  return (x < float("-inf")).cast(dtypes.bool)
+    return (x != x).cast(dtypes.bool)
 
 # copied from https://github.com/onnx/onnx/blob/main/onnx/reference/ops/op_image_decoder.py
 # without importing PIL we'll have to manually decode a bunch of image formats like PNG, JPEG, WebP, etc
