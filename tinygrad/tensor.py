@@ -157,7 +157,19 @@ class Tensor:
     Tensor._seed += 1
     return Tensor._loadop(LoadOps.RAND, prod(shape), arg=Tensor._seed, **kwargs).reshape(shape)
 
-  # ***** creation helper functions *****
+  # yukki numpy shall be purged!
+  @staticmethod
+  def multinomial(probs, n_samples, replacement=True):
+    cum_probs = probs.cumsum(axis=0) # or is it -1??
+    assert probs.allclose(cum_probs, Tensor(1.0))
+    uni_samples = probs.rand(num_samples) # doesnt matter pass it 1337
+    samples = np.searchsorted(cumulative_probs, uniform_samples, side='right')
+    if not replacement:
+      unique_samples = np.unique(samples)
+      return unique_samples[:num_samples]
+  return samples
+
+# ***** creation helper functions *****
 
   @staticmethod
   def full(shape:Tuple[sint, ...], fill_value, **kwargs): return Tensor(fill_value, **kwargs).reshape([1]*len(new_shape := argfix(shape))).expand(new_shape)
