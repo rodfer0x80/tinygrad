@@ -1,9 +1,7 @@
-from typing import List, Tuple, Dict, Any
-from tinygrad.helpers import ImageDType, prod, IMAGE, getenv, dtypes, DEBUG, flatten
+from typing import Tuple, Dict, Any
+from tinygrad.helpers import prod, IMAGE, getenv, dtypes, DEBUG
 
 # *** image Tensor function replacements ***
-
-from tinygrad.lazy import get_single_root
 
 def image_dot(self, w):
   # NOTE: we use a 1x1 conv2d to do the matmul. mxk @ kxn = (1,k,m,1).conv2d(n,k,1,1)
@@ -60,7 +58,6 @@ def image_conv2d(self, weight, bias=None, groups=1, stride=1, dilation=1, paddin
   # contiguous creates the image, and early realize static weights (TODO: test for the static weight)
   if IMAGE >= 2: x,w = x.cast(base_image_type((bs*iy, ix*groups*cin//4, 4))), w.cast(base_image_type((cout//4, H*W*cin, 4)))
   x, w = x.contiguous(), w.contiguous()
-  if getenv("PREREALIZE", 1) and get_single_root(w.lazydata).realized: w.realize()
 
   # expand out
   rcin_hi, rcin_lo = cin//4 if cin >= 4 else 1, 4 if cin >= 4 else 1
@@ -98,59 +95,6 @@ def image_conv2d(self, weight, bias=None, groups=1, stride=1, dilation=1, paddin
   ret = ret.reshape(bs, oy, ox, cout).permute(0,3,1,2)
   return ret if bias is None else ret.add(bias.reshape(1, -1, 1, 1))
 
-# *** schedules with images need to be fixed to be valid ***
-
-import dataclasses
-from tinygrad.ops import ScheduleItem, BufferOps, LazyOp, UnaryOps, LoadOps, MemBuffer, get_lazyop_info
-
-def fix_schedule_for_images(schedule:List[ScheduleItem]):
-  # this is the fundamental fix, find unwritable or unreadable images and convert them to normal float32 (TODO: should it be float16?)
-  replace_inputs = {}
-  for i, si in enumerate(schedule):
-    if isinstance(si.out.dtype, ImageDType) and (prod(si.out.shape) != prod(si.out.dtype.shape) or not any(si.out.shape[x]%4 == 0 for x in si.out.st.unit_stride_axes())):
-      if DEBUG >= 1: print(f"{i:3d}: rewrite output, output shape {prod(si.out.shape)}, image dtype {si.out.dtype} prod {prod(si.out.dtype.shape)}")
-      si.out.dtype = dtypes.float32
-    for b in si.ast.get_lazyops():
-      if b.op != BufferOps.MEM: continue
-      if isinstance(si.inputs[b.arg.idx-1].dtype, ImageDType) and not any(b.arg.st.shape[x]%4 == 0 for x in b.arg.st.unit_stride_axes()):
-        if DEBUG >= 1: print(f"{i:3d}: rewrite input, image dtype {si.inputs[b.arg.idx-1].dtype}, {b.arg.st.views}")
-        if si.inputs[b.arg.idx-1].realized:
-          # have to copy it
-          replace_inputs[si.inputs[b.arg.idx-1]] = si.inputs[b.arg.idx-1].cast(dtypes.float32)
-        else:
-          # change it before it's created
-          si.inputs[b.arg.idx-1].dtype = dtypes.float32
-
-  # now fix up the schedule to reflect the new dtypes
-  fixed_schedule:List[ScheduleItem] = []
-  for i,si in enumerate(schedule):
-    ast = si.ast
-    inputs = si.inputs
-
-    # replace inputs with casted versions
-    if any(x in replace_inputs for x in inputs):
-      fixed_schedule += flatten([replace_inputs[x].schedule() for x in inputs if x in replace_inputs])
-      inputs = tuple(replace_inputs.get(x, x) for x in inputs)
-
-    # fix input dtypes to match what they actually are
-    replacements = {}
-    for b in si.ast.get_lazyops():
-      if b.op != BufferOps.MEM: continue
-      if b.arg.dtype != inputs[b.arg.idx-1].dtype:
-        replacements[b] = LazyOp(BufferOps.MEM, (), MemBuffer(b.arg.idx, inputs[b.arg.idx-1].dtype, b.arg.st))
-    if replacements: ast = ast.map_buffers(replacements)
-
-    # fix the ops to create the output dtype
-    if ast.op not in LoadOps:
-      info = get_lazyop_info(ast)
-      if info.dtype != si.out.dtype:
-        if DEBUG >= 3: print(f"{i:3d}: info.dtype {info.dtype} != {si.out.dtype} -> {si.out.dtype}")
-        ast = LazyOp(UnaryOps.CAST, (ast,), (si.out.dtype, False))
-
-    # put this in the fixed schedule
-    fixed_schedule.append(dataclasses.replace(si, ast=ast, inputs=inputs))
-  return fixed_schedule
-
 # *** images have weird indexing requirements ***
 
 from tinygrad.shape.symbolic import Node, AndNode, Variable, NumNode, SumNode, LtNode
@@ -162,7 +106,8 @@ def to_image_idx(base_shape:Tuple[int, ...], idxy:Node, valid:Node) -> Tuple[Tup
   if valid.min == 0 and isinstance(idxy, SumNode):
     nodes = valid.nodes if isinstance(valid, AndNode) else [valid]
     val_dict: Dict[Node, Any] = {}
-    idxy_flat_var = [(i, i.vars()[0]) for i in idxy.flat_components if not isinstance(i, NumNode)]
+    # TODO: is this correct? should it check there's only one variable from each component?
+    idxy_flat_var = [(i, list(i.vars())[0]) for i in idxy.flat_components if not isinstance(i, NumNode)]
 
     for node in nodes:
       assert isinstance(node, LtNode)
@@ -179,6 +124,7 @@ def to_image_idx(base_shape:Tuple[int, ...], idxy:Node, valid:Node) -> Tuple[Tup
 
     fakes = {}
     for cnt, (key_node, (mnn, mxn, multip)) in enumerate(val_dict.items()):
+      if mnn > mxn: return (idx, idy), valid  # TODO: why is this happening?
       fake_var = Variable("fake_" + str(cnt), mnn, mxn)
       fakes[fake_var] = key_node
       idxy += multip*(fake_var - key_node)

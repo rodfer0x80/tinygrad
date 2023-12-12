@@ -10,32 +10,16 @@ import functools
 from typing import Union, Tuple, Optional, List, Any
 import math
 
+tensor_methods = {"Neg", "Reciprocal", "Sqrt", "Sign", "Abs", "Exp", "Log", "Mish", "Sin", "Cos", "Tan", "Relu", "Sigmoid", "Tanh", "MatMul",
+                  "Floor", "Ceil", "Tanh", "Softplus", "HardSwish", "Where", "Mul", "Sinh", "Cosh", "Softsign", "Asinh", "Acosh", "Atanh"}
+
 # **************** Free Ops ****************
 
 def Identity(input: Tensor): return input
-def Neg(input: Tensor): return -input
 def Add(input: Tensor, other: Tensor, broadcast=None): return input + other if input.dtype == dtypes.float or isinstance(input.dtype, ImageDType) else (input + other).cast(input.dtype)
 def Sub(input: Union[Tensor, Any], other: Tensor): return input - other # some test has input as int
-def Mul(input: Tensor, other: Tensor): return (input * other) if input.dtype == dtypes.float or isinstance(input.dtype, ImageDType) else (input * other).cast(input.dtype)
-# in openpilot, due to SHUFFLE_PAD_OPS issues, we are spending an extra kernel
-def Div(input: Tensor, other: Tensor): return input / other if input.dtype == dtypes.float or isinstance(input.dtype, ImageDType) else input.div(other).floor()
-def Pow(input: Tensor, other: Tensor): return (input.float() ** other.float()).cast(input.dtype)
-def Reciprocal(input: Tensor): return input.reciprocal()
-def Sqrt(input: Tensor): return input.sqrt()
-def Sign(input: Tensor): return input.sign()
-def Abs(input: Tensor): return input.abs()
-def Exp(input: Tensor): return input.exp()
-def Log(input: Tensor): return input.log()
-def Mish(input: Tensor): return input.mish()
-def Sin(x: Tensor): return x.sin()
-def Cos(x: Tensor): return x.cos()
-def Tan(x: Tensor): return x.tan()
-def Relu(input: Tensor): return input.relu()
-def Sigmoid(input: Tensor): return input.sigmoid()
-def Tanh(input: Tensor): return input.tanh()
-def MatMul(input: Tensor, other: Tensor): return input.matmul(other)
-def Floor(x:Tensor): return x.floor()
-def Ceil(x:Tensor): return x.ceil()
+def Div(input: Tensor, other: Tensor): return input / other if input.dtype == dtypes.float or isinstance(input.dtype, ImageDType) else input.div(other).floor()   # TODO: this has dtype issues
+def Pow(input: Tensor, other: Tensor): return (input.float() ** other.float()).cast(input.dtype)   # TODO: this has dtype issues
 def Less(x:Tensor,y:Tensor): return (x<y).cast(dtypes.bool)
 def LessOrEqual(x:Tensor,y:Tensor): return (x<=y).cast(dtypes.bool)
 def Greater(x:Tensor,y:Tensor): return (x>y).cast(dtypes.bool)
@@ -45,7 +29,6 @@ def Max(*data_0): return functools.reduce(Tensor.maximum, data_0)
 def Min(*data_0): return functools.reduce(Tensor.minimum, data_0)
 def Sum(*data_0): return functools.reduce(Tensor.__add__, data_0)
 def Mean(*data_0): return functools.reduce(Tensor.__add__, data_0) / len(data_0)
-def Where(condition:Tensor,X:Tensor,Y:Tensor): return condition.where(X, Y).cast(X.dtype)
 def Cast(input: Tensor, to): return input.cast(dtypes.from_np(tensor_dtype_to_np_dtype(to)))
 
 # **************** Simple Ops ****************
@@ -58,17 +41,10 @@ def Constant(value: Tensor=None, value_float=None, value_floats=None, value_int=
   elif value_ints: return Tensor(list(value_ints), dtype=dtypes.int64, requires_grad=False)
   elif value_string or value_strings: raise NotImplementedError(f'value_string or value_strings not implemented for Constant op')
 
-def Softsign(input: Tensor): return input / (1+input.abs())
-def Cosh(x): return (math.e ** x + math.e ** -x) / 2
-def Sinh(x): return (math.e ** x - math.e ** -x) / 2
-def Tanh(x): return x.tanh()
-
 def HardSigmoid(input: Tensor, alpha=0.2, beta=0.5): return (alpha*input + beta).clip(0, 1)
-def HardSwish(input: Tensor): return input * HardSigmoid(input, 1/6, 0.5)
 def Gelu(x:Tensor, approximate=None): return x.gelu() if approximate == "tanh" else 0.5 * x * (1 + Erf(x/math.sqrt(2)))
-def Celu(X: Tensor, alpha=1.0): return X.relu() - (-alpha*(X/alpha).exp()+1).relu()
+def Celu(x:Tensor, alpha=1.0): return x.celu(alpha)
 def Selu(X: Tensor, alpha=1.67326319217681884765625, gamma=1.05070102214813232421875): return gamma * (X.relu() - (-alpha*X.exp()+alpha).relu())
-def Softplus(X: Tensor): return X.softplus()
 def PRelu(X:Tensor, slope:Tensor):
   slope = slope[0] if slope.shape[-1] != X.shape[-1] else slope # HACK OnnxBackendPyTorchConvertedModelTest HAS WEIRD SLOPE WHERE IT'S [0.25, 0.25, 0.25] FOR ANY X.SHAPE
   return X.clip(0, float("inf")) + X.clip(float("-inf"), 0) * slope
@@ -98,21 +74,18 @@ def OptionalHasElement(x: Tensor=None): return Tensor(x is not None and x.numel(
 def OptionalGetElement(x: Tensor=None): return x if x is not None else Tensor([], dtype=dtypes.float32)
 
 def Tile(input: Tensor, repeats): return input.repeat([int(x) for x in safe_numpy(repeats)])
-def Range(start: Tensor, limit, delta): return Tensor.arange(start=int(safe_numpy(start)), stop=int(safe_numpy(limit)), step=int(safe_numpy(delta))).cast(dtype=start.dtype)
+def Range(start: Tensor, limit, delta): return Tensor.arange(start=int(safe_numpy(start).item()), stop=int(safe_numpy(limit).item()), step=int(safe_numpy(delta).item())).cast(dtype=start.dtype)
 def Shape(data: Tensor, end=None, start=0): return Tensor(list(data.shape)[start:end], dtype=dtypes.int32 if os.path.isfile("/TICI") else dtypes.int64)  # TODO: really?
 def Size(data: Tensor): return prod(data if isinstance(data, list) else data.shape)
 def Flatten(input: Tensor, axis=1): return input.reshape(prod((1,) + input.shape[0:axis]), -1)
 def Reshape(data: Tensor, shape: Tensor, allowzero=None): return data.reshape([int(x) if x != 0 else data.shape[i] for i,x in enumerate(safe_numpy(shape))])
 def Shrink(input: Tensor, bias=0.0, lambd=0.5): return (input < -lambd)*(input+bias) + (input > lambd)*(input-bias)
-def And(x:Tensor, y:Tensor): return Where((x==y), x, Tensor.zeros(*x.shape)).cast(dtypes.bool)
-def Or(x:Tensor, y:Tensor): return Where((x==y), x, Tensor.ones(*x.shape)).cast(dtypes.bool)
-def Xor(x:Tensor, y:Tensor): return Where((x==y), Tensor.zeros(*x.shape), Tensor.ones(*x.shape)).cast(dtypes.bool)
-def Not(x:Tensor): return Where((x==1), Tensor.zeros(*x.shape), Tensor.ones(*x.shape)).cast(dtypes.bool)
+def And(x:Tensor, y:Tensor): return (x==y).where(x, Tensor.zeros(*x.shape)).cast(dtypes.bool)
+def Or(x:Tensor, y:Tensor): return (x==y).where(x, Tensor.ones(*x.shape)).cast(dtypes.bool)
+def Xor(x:Tensor, y:Tensor): return (x==y).where(Tensor.zeros(*x.shape), Tensor.ones(*x.shape)).cast(dtypes.bool)
+def Not(x:Tensor): return (x==1).where(Tensor.zeros(*x.shape), Tensor.ones(*x.shape)).cast(dtypes.bool)
 
 def Asin(x): return Atan(x / Tensor.sqrt(1 - x * x))
-def Asinh(x): return Tensor.log(x + Tensor.sqrt(x * x + 1))
-def Acosh(x): return Tensor.log(x + Tensor.sqrt(x * x - 1))
-def Atanh(x): return 0.5 * Tensor.log((1 + x)/(1 - x))
 def Acos(x: Tensor):
   negate = (x < 0)
   x = x.abs()
@@ -179,7 +152,6 @@ def Expand(input: Tensor, shape):
   x_shape, y_shape = [([1]*(max(len(x_shape), len(y_shape))-len(t_shape)) + list(t_shape)) for t_shape in [x_shape, y_shape]]
   shape_ret = tuple(max(sx, sy) for sx,sy in zip(x_shape, y_shape))
   return input.reshape(x_shape).expand(shape_ret)
-
 
 # **************** Complex Ops ****************
 
@@ -344,14 +316,21 @@ def Conv(X: Tensor, W: Tensor, B=None, auto_pad="NOTSET", dilations=1, group=1, 
   return X.conv2d(W, B, stride=strides, groups=group, dilation=dilations, padding=padding)
 
 def ConvTranspose(X: Tensor, W: Tensor, B=None, auto_pad="NOTSET", dilations=1, group=1, kernel_shape=None, pads=None, output_shape=None, output_padding=0, strides=1):
-  if not kernel_shape: kernel_shape = W.shape
-  if pads is None and auto_pad != "NOTSET": pads = _auto_pad(X, auto_pad, strides, kernel_shape, dilations)
-  elif pads is None and auto_pad == "NOTSET": pads = [0,0] * (X.ndim - 2)
-  strides_ = [1]*(W.ndim-1) + [strides] if isinstance(strides, int) else [1]*(W.ndim-len(strides)) + list(strides)
-  dilations_ = [1]*(W.ndim-1) + [dilations] if isinstance(dilations, int) else [1]*(W.ndim-len(dilations)) + list(dilations)
-  if output_shape and not output_padding:
-    out_sh = [st*(xs-1) + (ks-1)*di+1 if n < 2 else st*(xs-1) + (ks-1)*di+1 - pads[n-2] - pads[n-1] for n, (st, xs, ks, di) in enumerate(zip(strides_, X.shape, kernel_shape, dilations_))]
-    output_padding = [os - rs for os, rs in zip(output_shape, out_sh[-len(output_shape):])]
+  if kernel_shape is None: kernel_shape = W.shape[2:]
+  if isinstance(strides, int): strides = [strides]*(W.ndim-2)
+  if isinstance(dilations, int): dilations = [dilations]*(W.ndim-2)
+  if isinstance(output_padding, int): output_padding = [output_padding]*(W.ndim-2)
+  out_sh = [st*(xs-1) + (ks-1)*di+1 if n < 2 else st*(xs-1) + (ks-1)*di+1 - pads[n-2] - pads[n-1] for n, (st, xs, ks, di) in enumerate(zip(strides, X.shape[2:], kernel_shape, dilations))] if output_shape is not None or auto_pad != "NOTSET" else []
+  if pads is None:
+    if output_shape is None: output_shape = [xs*st for xs, st in zip(X.shape[2:], strides)]
+    if auto_pad == "NOTSET": pads = [0,0] * (X.ndim - 2)
+    else:
+      total_padding = [st*(ish-1) + pad + ((ks-1)*dil+1)-osh for st, ish, pad, ks, dil, osh in zip(strides, X.shape[2:], output_padding, kernel_shape, dilations, output_shape)]
+      pad_shape = flatten([[sh//2, sh-sh//2] for sh in total_padding])
+      pads = pad_shape[::2] + pad_shape[1::2] if auto_pad == "SAME_UPPER" else pad_shape[1::2] + pad_shape[::2]
+  else:
+    if output_shape is None: output_shape = [st*(xs-1) + (ks-1)*di+1 if n < 2 else st*(xs-1) + (ks-1)*di+1 - pads[n-2] - pads[n-1] for n, (st, xs, ks, di) in enumerate(zip(strides, X.shape[2:], kernel_shape, dilations))]
+  if out_sh: output_padding = [os - rs for os, rs in zip(output_shape, out_sh)]
   return X.conv_transpose2d(W, B, stride=strides, groups=group, dilation=dilations, padding=pads if pads is not None else 0, output_padding=output_padding)
 
 # Reimplemented here because you need legacy RNG for passing ONNX tests.

@@ -5,13 +5,11 @@ from collections import defaultdict
 from enum import Enum, auto
 from dataclasses import dataclass
 
-from tinygrad.helpers import colored, ImageDType, DEBUG, dtypes, DType, prod, PtrDType, getenv, all_same
-from tinygrad.ops import LazyOp, UnaryOps, ConstBuffer, MemBuffer, BufferOps
-from tinygrad.ops import ReduceOps, BinaryOps, TernaryOps
+from tinygrad.helpers import colored, ImageDType, DEBUG, dtypes, DType, prod, PtrDType, getenv, all_same, to_function_name, flatten
+from tinygrad.ops import LazyOp, UnaryOps, BinaryOps, TernaryOps, ReduceOps, ConstBuffer, MemBuffer, BufferOps, vars_from_ast
 from tinygrad.shape.shapetracker import ShapeTracker
-from tinygrad.shape.symbolic import Variable, NumNode, VariableOrNum, Node, SumNode, MulNode, DivNode, ModNode, LtNode, AndNode, sym_rename
+from tinygrad.shape.symbolic import Variable, NumNode, VariableOrNum, Node, SumNode, MulNode, DivNode, ModNode, LtNode, AndNode
 from tinygrad.codegen.kernel import LocalBuffer, Kernel
-from tinygrad.lazy import vars_from_ast
 from tinygrad.features.image import to_image_idx
 
 # bottom ones are asm only
@@ -47,6 +45,11 @@ class Linearizer(Kernel):
 
   # NOTE: the consts have to be cached for deduping of downstream uops to work
   def const(self, b:Union[int,float], dtype=dtypes.int32, insert_before=None) -> UOp: return self.uop(UOps.CONST, dtype, tuple(), b, insert_before=insert_before)
+  def cast(self, val: UOp, dtype) -> UOp: return self.uop(UOps.CAST, dtype, (val,)) if val.dtype != dtype else val
+
+  def get_reduce_acc(self, op, dtype:DType):
+    if op == ReduceOps.SUM: return 0.0 if dtypes.is_float(dtype) else 0
+    elif op == ReduceOps.MAX: return -math.inf if dtypes.is_float(dtype) else -2**31 if dtypes.is_int(dtype) else False
 
   render_ops: Any = { Variable: lambda self, ops, ctx: ctx.loop_uops[self.expr], NumNode: lambda self, ops, ctx: ctx.const(self.b),
                 MulNode: lambda self, ops, ctx: ctx.uop_alu_idx(self.a.render(ops, ctx), self.b, ops, ctx, BinaryOps.MUL),
@@ -75,39 +78,47 @@ class Linearizer(Kernel):
         (g_idx, g_valid), amt, dim = self.sts[i].expr_idxs(fake_idxs), 1, None
     else:
       g_idx, g_valid = self.sts[i].expr_idxs(fake_idxs)
-    localtype = dtypes.float32 if amt == 1 else dtypes._float4 if amt == 4 else dtypes._float2
+    localtype = buf.dtype if amt == 1 else buf.dtype.vec(amt)
+    if isinstance(buf.dtype, ImageDType): localtype = dtypes.float if amt == 1 else dtypes.float.vec(amt)
 
     e_idxs, e_valids = g_idx.expand(expand_vars), g_valid.expand(expand_vars)
 
     ret = []
     invalid_value = 0 if dtypes.is_int(buf.dtype) else 0.0
     for idx, valid, rep_idx in zip(e_idxs, e_valids, Node.iter_idxs(expand_vars)):
-      this_const, idx, valid = (invalid_value, Variable.num(0), Variable.num(1)) if valid.max == 0 else (const, idx, valid)
+      this_const, idx, valid = (invalid_value, NumNode(0), NumNode(1)) if valid.max == 0 else (const, idx, valid)
       key = f"{acc}{localtype}{this_const if this_const is not None and acc is None else (buf.idx if isinstance(buf, MemBuffer) else cast(LocalBuffer, buf).name)}{idx.render()}{valid.render()}"
       if key not in self.load_cache:
         if acc is not None:
-          assert valid.min == 1
           self.load_cache[key] = self.uop(UOps.DEFINE_ACC, localtype, (), this_const, cachable=False)
         elif this_const is not None:
           self.load_cache[key] = self.const(this_const, localtype)
           if valid.min == 0 and valid.max == 1:
             valid_rendered = valid.render(self.render_ops, self)
             self.load_cache[key] = self.uop(UOps.ALU, localtype, (valid_rendered, self.load_cache[key], self.const(invalid_value, localtype)), TernaryOps.WHERE)
+        elif isinstance(buf.dtype, ImageDType):
+          buf_uop = self.buf_uops[i]
+          assert buf_uop is not None, f"buffer {i} wasn't UOped"
+          image_idx, valid = to_image_idx(buf.dtype.shape, idx, valid)
+          rendered_idx = self.uop(UOps.CAST, dtypes.int.vec(2), (image_idx[0].render(self.render_ops, self), image_idx[1].render(self.render_ops, self)))
+          valid_tuple = (valid.render(self.render_ops, self), self.const(invalid_value, dtypes.float32.vec(4))) if valid.min == 0 else tuple()
+          self.load_cache[key] = self.uop(UOps.LOAD, dtypes.float32.vec(4), (buf_uop, rendered_idx) + valid_tuple + ((barrier,) if barrier else ()))
+          idx_small = idx%4
+          res = idx_small.render(self.render_ops, self)
+          if localtype == localtype.scalar():
+            out = self.uop(UOps.GEP, localtype, (self.load_cache[key],), idx_small.max)
+            for ix in range(idx_small.max, idx_small.min, -1):
+              rvv = self.uop(UOps.GEP, localtype, (self.load_cache[key],), ix-1)
+              sel = self.uop(UOps.ALU, res.dtype, (res, self.const(ix)), BinaryOps.CMPLT)
+              out = self.uop(UOps.ALU, localtype, (sel, rvv, out), TernaryOps.WHERE)
+            self.load_cache[key] = out
         else:
           buf_uop = self.buf_uops[i]
           assert buf_uop is not None, f"buffer {i} wasn't UOped"
-          if isinstance(buf.dtype, ImageDType):
-            idx, valid = to_image_idx(buf.dtype.shape, idx, valid)
-            rendered_idx = self.uop(UOps.CAST, dtypes._int2, (idx[0].render(self.render_ops, self), idx[1].render(self.render_ops, self)))
-          else:
-            rendered_idx = idx.render(self.render_ops, self)
-
-          if valid.min == 0:
-            valid_rendered = valid.render(self.render_ops, self)
-            self.load_cache[key] = self.uop(UOps.LOAD, localtype, (buf_uop, rendered_idx, valid_rendered, self.const(invalid_value, localtype)) + ((barrier,) if barrier else ()))
-          else:
-            self.load_cache[key] = self.uop(UOps.LOAD, localtype, (buf_uop, rendered_idx) + ((barrier,) if barrier else ()))
-      ret.append(self.uop(UOps.GEP, dtypes.float32, (self.load_cache[key],), rep_idx[dim]) if dim is not None else self.load_cache[key])
+          rendered_idx = idx.render(self.render_ops, self)
+          valid_tuple = (valid.render(self.render_ops, self), self.const(invalid_value, localtype)) if valid.min == 0 else tuple()
+          self.load_cache[key] = self.uop(UOps.LOAD, localtype, (buf_uop, rendered_idx) + valid_tuple + ((barrier,) if barrier else ()))
+      ret.append(self.uop(UOps.GEP, localtype.scalar(), (self.load_cache[key],), rep_idx[dim]) if dim is not None else self.load_cache[key])
     return ret
 
   def global_store(self, i:int, idxs:List[Node], store:List[UOp]) -> List[UOp]:
@@ -131,8 +142,7 @@ class Linearizer(Kernel):
         amt = len(out_tokens)
         idx, valid = self.sts[i].expr_idxs(k)
         assert idx.render() == ((idx//amt)*amt).render(), "float4 stores are always aligned"
-        assert valid.min == 1, "stores are always valid"
-        store_offset_new[k] = self.uop(UOps.CAST, dtypes._float4 if amt == 4 else dtypes._float2, tuple(out_tokens))
+        store_offset_new[k] = self.uop(UOps.CAST, buf.dtype.vec(amt), tuple(out_tokens))
       store_offset = store_offset_new
 
     stores = []
@@ -140,10 +150,11 @@ class Linearizer(Kernel):
       idx, valid = self.sts[i].expr_idxs(idx)
       if isinstance(buf.dtype, ImageDType):
         idx, valid = to_image_idx(buf.dtype.shape, idx, valid)
-        rendered_idx = self.uop(UOps.CAST, dtypes._int2, tuple(x.render(self.render_ops, self) for x in idx))
+        rendered_idx = self.uop(UOps.CAST, dtypes.int.vec(2), tuple(x.render(self.render_ops, self) for x in idx))
       else:
         rendered_idx = idx.render(self.render_ops, self)
-      stores.append(self.uop(UOps.STORE, None, (buf_uop, rendered_idx, var)))
+      if valid.min == 1: stores.append(self.uop(UOps.STORE, None, (buf_uop, rendered_idx, var)))
+      else: stores.append(self.uop(UOps.STORE, None, (buf_uop, rendered_idx, var, valid.render(self.render_ops, self))))
     return stores
 
   kernel_cnt: Final[DefaultDict[str, int]] = defaultdict(int)
@@ -184,13 +195,12 @@ class Linearizer(Kernel):
       self.buf_uops.append(self.uop(UOps.DEFINE_LOCAL, PtrDType(dtypes.float32), (), ("temp", self.sts[-1].size())))
 
     # kernel name (before late upcast)
-    self.function_name = ("r_" if self.reduceop else "E_") + '_'.join([str(x) if isinstance(x, int) else sym_rename(x) for x in self.full_shape])
-    self.display_name = ("r_" if self.reduceop else "E_") + colored('_', 'BLACK').join([colored(str(x), c) for x,c in zip(self.full_shape, self.colors())])
+    self.name = ("r_" if self.reduceop else "E_") + colored('_', 'BLACK').join([colored(str(x), c) for x,c in zip(self.full_shape, self.colors())])
 
     # name the function something unique
-    Linearizer.kernel_cnt[self.function_name] += 1
-    suffix = f"{'n'+str(Linearizer.kernel_cnt[self.function_name]-1)}" if Linearizer.kernel_cnt[self.function_name] > 1 else ""
-    self.function_name, self.display_name = self.function_name+suffix, self.display_name+colored(suffix, 'BLACK')
+    Linearizer.kernel_cnt[(function_name := to_function_name(self.name))] += 1
+    suffix = f"{'n'+str(Linearizer.kernel_cnt[function_name]-1)}" if Linearizer.kernel_cnt[function_name] > 1 else ""
+    self.name = self.name+colored(suffix, 'BLACK')
 
     # define indexes
     global_idxs, loop_global_idxs = get_grouped_dims("gidx", 0, self.full_shape[:self.global_dims], 3 if self.opts.has_local else 0)
@@ -214,8 +224,6 @@ class Linearizer(Kernel):
       self.loop_uops.update({x.expr:self.uop(UOps.SPECIAL, dtypes.int32, (), (len(loop_global_idxs)-1-i, x.expr.replace("gidx", "idx"), x.max+1)) for i,x in enumerate(loop_global_idxs)})
     elif self.opts.has_local:
       self.global_size, self.local_size = [x.max+1 for x in loop_global_idxs][::-1], [x.max+1 for x in loop_local_idxs][::-1]
-      self.global_size += [1]*(3-len(self.global_size))
-      self.local_size += [1]*(3-len(self.local_size))
       self.loop_uops.update({x.expr:self.uop(UOps.SPECIAL, dtypes.int32, (), (len(loop_global_idxs)-1-i, x.expr, x.max+1)) for i,x in enumerate(loop_global_idxs)})
       self.loop_uops.update({x.expr:self.uop(UOps.SPECIAL, dtypes.int32, (), (len(loop_local_idxs)-1-i, x.expr, x.max+1)) for i,x in enumerate(loop_local_idxs)})
     else:
@@ -223,7 +231,7 @@ class Linearizer(Kernel):
 
     # parse AST
     loaded_buffers = {}
-    acc = []
+    acc: List[UOp] = []
     self.load_cache: Dict[str, UOp] = {}
 
     # reduce op
@@ -234,13 +242,13 @@ class Linearizer(Kernel):
       fake_reduce_idxs = [x*0 for x in reduce_idxs]
 
       # define accumulator
-      acc = self.global_load(0, global_idxs+local_idxs+fake_reduce_idxs+upcast_idxs, {ReduceOps.SUM: 0.0, ReduceOps.MAX: -math.inf}[cast(ReduceOps, self.reduceop.op)])
+      acc = self.global_load(0, global_idxs+local_idxs+fake_reduce_idxs+upcast_idxs, self.get_reduce_acc(self.reduceop.op, self.bufs[0].dtype))
 
       if self.tensor_core:
         def calc_tc_idxs(local_size: int, aliases: List[List[int]]):
           replace_idxs = []
           for alias in aliases:
-            full_var, full_var_sz = Variable.num(0), 1
+            full_var, full_var_sz = NumNode(0), 1
             if alias[0] != 0:
               for i in alias:
                 next_var = local_idxs[-i] if i > 0 else Variable(None, 0, local_size-1)
@@ -290,10 +298,10 @@ class Linearizer(Kernel):
               if self.opts.device != "HIP":
                 ops = tuple(op1+op2+op3)
               else:
-                ops = (self.uop(UOps.CAST, dtypes._half16, tuple(op1)),
-                       self.uop(UOps.CAST, dtypes._half16, tuple(op2)),
-                       self.uop(UOps.CAST, dtypes._float8, tuple(op3)))
-              ret = self.uop(UOps.WMMA, dtypes._float2 if wmma_sz[2] == 2 else dtypes._float8, ops, (self.opts.device, self.tensor_core.dtype_in, self.tensor_core.dtype_out,))
+                ops = (self.uop(UOps.CAST, dtypes.half.vec(16), tuple(op1)),
+                       self.uop(UOps.CAST, dtypes.half.vec(16), tuple(op2)),
+                       self.uop(UOps.CAST, dtypes.float.vec(8), tuple(op3)))
+              ret = self.uop(UOps.WMMA, dtypes.float.vec(2) if wmma_sz[2] == 2 else dtypes.float.vec(8), ops, (self.opts.device, self.tensor_core.dtype_in, self.tensor_core.dtype_out,))
               for z in range(cast(DType, ret.dtype).sz):
                 acc[i+z] = self.uop(UOps.PHI, dtypes.float, (op3[z], self.uop(UOps.GEP, dtypes.float, (ret,), z)) + loop_ctx)
             i += wmma_sz[2]
@@ -318,7 +326,7 @@ class Linearizer(Kernel):
         stores = self.global_store(-1, fake_global_idxs+local_idxs+fake_reduce_idxs+upcast_idxs, acc)  # store accumulators
         barrier = self.uop(UOps.BARRIER, None, tuple(stores), cachable=False)
         if self.opts.has_local:
-          fake_idxs = [Variable.num(0)]*len(self.sts[-1].shape)
+          fake_idxs = [NumNode(0)]*len(self.sts[-1].shape)
           fake_idxs[self.global_dims+self.local_dims:self.global_dims+len(local_idxs)] = local_idxs[self.local_dims:]
           if_cond: UOp = (self.sts[-1].expr_idxs(fake_idxs)[0]<1).render(self.render_ops, self)
           barrier = self.uop(UOps.IF, None, (if_cond, barrier), cachable=False)
@@ -340,7 +348,7 @@ class Linearizer(Kernel):
         # NOTE: this structure is the same as the reduce op above
 
         # define late accumulator
-        acc = self.global_load(-1, fake_global_idxs+local_idxs+fake_reduce_idxs+upcast_idxs, {ReduceOps.SUM: 0.0, ReduceOps.MAX: -math.inf}[cast(ReduceOps, self.reduceop.op)])
+        acc = self.global_load(-1, fake_global_idxs+local_idxs+fake_reduce_idxs+upcast_idxs, self.get_reduce_acc(self.reduceop.op, self.bufs[-1].dtype))
 
         # late reduce loop
         loop_ctx = render_loop(end_local_idxs)
@@ -349,7 +357,7 @@ class Linearizer(Kernel):
         loaded_buffers[self.bufs[-1]] = self.global_load(-1, fake_global_idxs+local_idxs+fake_reduce_idxs+upcast_idxs, barrier=barrier)
 
         # there's no AST here (and there's no shape for the reduce LazyOp)
-        self.ast_parse(LazyOp(self.reduceop.op, (self.bufs[-1],)), acc, self.acc_offsets(-1), loaded_buffers, do_reduce=True, loop_ctx=loop_ctx) # type: ignore
+        self.ast_parse(LazyOp(self.reduceop.op, (LazyOp(BufferOps.LOAD, (), self.bufs[-1]),)), acc, self.acc_offsets(-1), loaded_buffers, do_reduce=True, loop_ctx=loop_ctx)
 
         # end the late reduce loop
         self.load_cache.clear()
@@ -357,24 +365,17 @@ class Linearizer(Kernel):
     # load latebufs
     loaded_buffers.update({b:self.global_load(i, global_idxs+local_idxs+fake_reduce_idxs+upcast_idxs) for i,b in enumerate(self.bufs) if b not in self.earlybufs and i != 0 and b.__class__ is not LocalBuffer})
 
-    # run late AST
-    val = self.ast_parse(self.ast, acc, None, loaded_buffers)
+    # run late AST (without the store)
+    val = self.ast_parse(cast(LazyOp, self.ast.src[0]), acc, None, loaded_buffers)
 
     # store
     self.global_store(0, global_idxs+local_idxs+fake_reduce_idxs+upcast_idxs, val)
 
     # graph helper functions
-    def get_recursive_parents(x:List[UOp]) -> List[UOp]:
-      ret: Set[UOp] = set()
-      this_round: Set[UOp] = set(x)
-      while len(this_round):
-        ret = ret.union(this_round)
-        next_round: Set[UOp] = set()
-        for r in this_round: next_round = next_round.union(set(r.vin))
-        this_round = next_round
-      return list(ret)
+    @functools.lru_cache(None)
+    def get_recursive_parents(x:UOp) -> Set[UOp]: return set.union(set(x.vin), *[get_recursive_parents(p) for p in x.vin])
 
-    def get_recursive_children(x:UOp) -> List[UOp]:
+    def get_recursive_children(x:UOp) -> Set[UOp]:
       deps = set([x])
       ssize = 0
       while ssize != len(deps):
@@ -382,12 +383,27 @@ class Linearizer(Kernel):
         for u in self.uops:
           if len(deps.intersection([x for x in u.vin if x.uop != UOps.PHI])):
             deps.add(u)
-      return sorted(list(deps), key=self.uops.index)    # get the last one
+      return deps
 
     def replace_op(old:UOp, new:UOp):
       for u in self.uops:
         u.vin = tuple(new if x is old else x for x in u.vin)
       self.uops.remove(old)
+
+    # fix loop scope, push CONST and ALU upward out of loop if it does not depend on the loop
+    loop_stack: List[List[UOp]] = [[]]
+    for u in self.uops:
+      if not loop_stack[-1]: loop_stack[-1].append(u)
+      elif u.uop == UOps.LOOP: loop_stack.append([u])
+      elif u.uop not in [UOps.CONST, UOps.ALU, UOps.CAST]: loop_stack[-1].append(u)
+      else:
+        parents = get_recursive_parents(u)
+        for i in reversed(range(len(loop_stack))):
+          # check backwards and put the uop in the first encounter with some dependency
+          if any(x in parents for x in loop_stack[i]) or i == 0:
+            loop_stack[i].append(u)
+            break
+    self.uops = flatten(loop_stack)
 
     # uops optimization
     changed_something = True
@@ -397,7 +413,7 @@ class Linearizer(Kernel):
         if u.uop == UOps.PHI and len(u.vin) == 3:
           # if the parents of the PHI node don't have the LOOP in their parents, it can be folded
           # TODO: ADD becomes a MUL, MAX can just become nothing
-          if all(x.uop != UOps.LOOP for x in get_recursive_parents(list(u.vin[0:2]))) and u.vin[1].arg == BinaryOps.ADD:
+          if all(x.uop != UOps.LOOP for x in get_recursive_parents(UOp(u.uop, u.dtype, u.vin[0:2], u.arg))) and u.vin[1].arg == BinaryOps.ADD:
             if DEBUG >= 4: print(f"removing PHI node {u}")
             del self.saved_exprs[(u.uop, u.dtype, u.vin, u.arg)]
             # NOTE: assuming u.vin[2].vin[1] and u.vin[2].vin[0] have the same dtype
@@ -424,7 +440,7 @@ class Linearizer(Kernel):
     for u in self.uops:
       if u.uop == UOps.LOOP:
         # add END of loops after the last thing that (recursively) depends on them
-        self.uop(UOps.END, None, (u,), cachable=False, insert_before=self.uops.index(get_recursive_children(u)[-1])+1)
+        self.uop(UOps.END, None, (u,), cachable=False, insert_before=self.uops.index(sorted(list(get_recursive_children(u)), key=self.uops.index)[-1])+1)
       elif u.uop == UOps.IF:
         # END any if statements at the end of the uops
         self.uop(UOps.END, None, (u,), cachable=False)
@@ -444,8 +460,14 @@ class Linearizer(Kernel):
     self.applied_opts_cache = self.applied_opts[:]
     return self
 
-  def uop(self, uop:UOps, dtype:Optional[DType], vin:Tuple[UOp, ...], arg:Any=None, cachable=True, insert_before=None, simplify=True) -> UOp:
+  def uop(self, uop:UOps, dtype:Optional[DType]=None, vin:Tuple[UOp, ...]=tuple(), arg:Any=None, cachable=True, insert_before=None, simplify=True) -> UOp:
     key = (uop, dtype, vin, arg)
+    if uop == UOps.PHI and vin[1].dtype != dtype: vin = (vin[0], self.cast(vin[1], dtype)) + vin[1:]
+    if uop == UOps.ALU: # upcast vins to the same dtype
+      upcast_dtype = dtypes.float if arg == TernaryOps.MULACC else max(cast(DType, x.dtype) for x in vin) # MULACC is only supported in float
+      if arg == TernaryOps.WHERE: vin = (vin[0],) + tuple(self.cast(x, upcast_dtype) for x in vin[1:]) # the first arg is always bool
+      else: vin = tuple(self.cast(x, upcast_dtype) for x in vin)
+      dtype = dtype or upcast_dtype # some ops like BinaryOps.CMPLT return bool
     if simplify:
       if uop == UOps.PHI and len(vin) == 2: return vin[1]   # a phi without loops is a noop
       if uop == UOps.GEP and vin[0].uop == UOps.CONST: return self.const(vin[0].arg, dtype, insert_before)
@@ -455,6 +477,7 @@ class Linearizer(Kernel):
         if arg == BinaryOps.ADD and vin[1].uop == UOps.ALU and vin[1].arg == UnaryOps.NEG: return self.uop(UOps.ALU, dtype, (vin[0], vin[1].vin[0]), BinaryOps.SUB, cachable=cachable, insert_before=insert_before)
         # constant folding
         if arg == UnaryOps.NEG and vin[0].uop == UOps.CONST: return self.const(-vin[0].arg, dtype, insert_before)
+        if arg == TernaryOps.WHERE and vin[1] == vin[2]: return vin[1] # a conditional with the same results either way is a noop
         # zero folding
         for x in [0,1]:
           if arg == BinaryOps.ADD and vin[x].uop == UOps.CONST and vin[x].arg == 0.0: return vin[1-x]
@@ -462,7 +485,9 @@ class Linearizer(Kernel):
           if arg == BinaryOps.MUL and vin[x].uop == UOps.CONST and vin[x].arg == 0.0: return vin[x]
         if arg == BinaryOps.SUB and vin[1].uop == UOps.CONST and vin[1].arg == 0.0: return vin[0]
         if arg == BinaryOps.DIV and vin[1].uop == UOps.CONST and vin[1].arg == 1.0: return vin[0]
-    if cachable and key in self.saved_exprs: return self.saved_exprs[key]
+
+    # When insert_before is set, need to check if the cached expr is valid with the given insert place.
+    if cachable and (expr:=self.saved_exprs.get(key, None)) is not None and (insert_before is None or self.uops.index(expr) <= insert_before): return expr
     ret = UOp(uop, dtype, vin, arg)
     if insert_before is not None:
       self.uops.insert(insert_before, ret)
@@ -471,11 +496,9 @@ class Linearizer(Kernel):
     if cachable: self.saved_exprs[key] = ret
     return ret
 
-  def ast_parse(self, x, acc, offs, loaded_buffers, do_reduce=False, loop_ctx=tuple()) -> List[UOp]:
-    if x.__class__ is not LazyOp: return loaded_buffers[x]    # for LOCAL_BUFFER
+  def ast_parse(self, x:LazyOp, acc: List[UOp], offs:Optional[List[int]], loaded_buffers:Dict[Union[MemBuffer, ConstBuffer, LocalBuffer], List[UOp]], do_reduce=False, loop_ctx=tuple()) -> List[UOp]:
     if x.op in BufferOps: return loaded_buffers[x.arg]
-    if x.op == UnaryOps.NOOP: return self.ast_parse(x.src[0], acc, offs, loaded_buffers)
-    if x.op == UnaryOps.CAST: return [self.uop(UOps.CAST, x.arg[0], (u,), x.arg) if not isinstance(x.arg[0], ImageDType) else u for u in self.ast_parse(x.src[0], acc, offs, loaded_buffers)]
+    if x.op == UnaryOps.CAST: return [self.uop(UOps.CAST, x.arg[0], (u,), x.arg) if not isinstance(x.arg[0], ImageDType) else u for u in self.ast_parse(cast(LazyOp, x.src[0]), acc, offs, loaded_buffers)]
     if x.op in ReduceOps and not do_reduce:
       assert offs is None, "not available if we aren't doing reduce"
       return acc
@@ -484,23 +507,17 @@ class Linearizer(Kernel):
       x = LazyOp(TernaryOps.MULACC, x.src[0].src, x.arg)
     if x.op == ReduceOps.SUM and x.src[0].__class__ is LazyOp and x.src[0].op == UnaryOps.CAST and x.src[0].src[0].__class__ is LazyOp and x.src[0].src[0].op == BinaryOps.MUL:
       x = LazyOp(TernaryOps.MULACC, x.src[0].src[0].src, x.arg)
-    values = [self.ast_parse(v, acc, offs, loaded_buffers, loop_ctx=loop_ctx) for v in x.src]
+    values = [self.ast_parse(cast(LazyOp, v), acc, offs, loaded_buffers, loop_ctx=loop_ctx) for v in x.src]
     ops = {ReduceOps.SUM:BinaryOps.ADD, ReduceOps.MAX:BinaryOps.MAX, TernaryOps.MULACC:TernaryOps.MULACC}
     if x.op in ops:
-      ret = []
+      ret: List[UOp] = []
       input_acc = acc[:]
-      for idx, val, off in zip([[i] for i in range(len(values[0]))], zip(*values), offs):
-        acc[off] = self.uop(UOps.ALU, dtypes.float32, val+(acc[off],), ops[x.op])
-        ret.append((idx, acc[off]))
+      for val, off in zip(zip(*values), cast(List[int], offs)):
+        acc[off] = self.uop(UOps.ALU, vin=val+(acc[off],), arg=ops[x.op])
+        ret.append(acc[off])
       for off in range(len(acc)):
         if input_acc[off] != acc[off]:
-          acc[off] = self.uop(UOps.PHI, dtypes.float32, (input_acc[off], acc[off]) + tuple(loop_ctx))
+          acc[off] = self.uop(UOps.PHI, input_acc[off].dtype, (input_acc[off], acc[off]) + tuple(loop_ctx))
     else:
-      ret = [(idx, self.uop(UOps.ALU, dtypes.float32, val, x.op)) for idx, val in zip([[i] for i in range(len(values[0]))], zip(*values))]
-    ordered_ret: List[Optional[UOp]] = [None]*len(values[0])
-    # scatter
-    for i,j in ret:
-      for k in i:
-        ordered_ret[k] = j
-    assert all(isinstance(x, UOp) for x in ordered_ret), "some tokens didn't get scattered?"
-    return cast(List[UOp], ordered_ret)
+      ret = [self.uop(UOps.ALU, dtype=dtypes.bool if x.op == BinaryOps.CMPLT else None, vin=val, arg=x.op) for val in zip(*values)]
+    return ret
